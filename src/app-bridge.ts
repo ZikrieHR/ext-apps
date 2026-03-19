@@ -74,6 +74,8 @@ import {
   McpUiDownloadFileResult,
   McpUiResourceTeardownRequest,
   McpUiResourceTeardownResultSchema,
+  McpUiRequestTeardownNotification,
+  McpUiRequestTeardownNotificationSchema,
   McpUiSandboxProxyReadyNotification,
   McpUiSandboxProxyReadyNotificationSchema,
   McpUiSizeChangedNotificationSchema,
@@ -670,6 +672,41 @@ export class AppBridge extends Protocol<
       async (request, extra) => {
         return callback(request.params, extra);
       },
+    );
+  }
+
+  /**
+   * Register a handler for app-initiated teardown request notifications from the view.
+   *
+   * The view sends `ui/notifications/request-teardown` when it wants the host to tear it down.
+   * If the host decides to proceed, it should send
+   * `ui/resource-teardown` (via {@link teardownResource `teardownResource`}) to allow
+   * the view to perform gracefull termination, then unmount the iframe after the view responds.
+   *
+   * @param callback - Handler that receives teardown request params
+   *   - params - Empty object (reserved for future use)
+   *
+   * @example
+   * ```typescript
+   * bridge.onrequestteardown = async (params) => {
+   *   console.log("App requested teardown");
+   *   // Initiate teardown to allow the app to persist unsaved state
+   *   // Alternatively, the callback can early return to prevent teardown
+   *   await bridge.teardownResource({});
+   *   // Now safe to unmount the iframe
+   *   iframe.remove();
+   * };
+   * ```
+   *
+   * @see {@link McpUiRequestTeardownNotification `McpUiRequestTeardownNotification`} for the notification type
+   * @see {@link teardownResource `teardownResource`} for initiating teardown
+   */
+  set onrequestteardown(
+    callback: (params: McpUiRequestTeardownNotification["params"]) => void,
+  ) {
+    this.setNotificationHandler(
+      McpUiRequestTeardownNotificationSchema,
+      (request) => callback(request.params),
     );
   }
 

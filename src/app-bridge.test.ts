@@ -520,6 +520,31 @@ describe("App <-> AppBridge integration", () => {
         }),
       ).rejects.toThrow("Context update failed");
     });
+
+    it("app.requestTeardown allows host to initiate teardown flow", async () => {
+      const events: string[] = [];
+
+      bridge.onrequestteardown = async () => {
+        events.push("teardown-requested");
+        await bridge.teardownResource({});
+        events.push("teardown-complete");
+      };
+
+      app.onteardown = async () => {
+        events.push("persist-unsaved-state");
+        return {};
+      };
+
+      await app.connect(appTransport);
+      await app.requestTeardown();
+      await flush();
+
+      expect(events).toEqual([
+        "teardown-requested",
+        "persist-unsaved-state",
+        "teardown-complete",
+      ]);
+    });
   });
 
   describe("App -> Host requests", () => {

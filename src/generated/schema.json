@@ -4074,6 +4074,23 @@
       "required": ["mode"],
       "additionalProperties": {}
     },
+    "McpUiRequestTeardownNotification": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "method": {
+          "type": "string",
+          "const": "ui/notifications/request-teardown"
+        },
+        "params": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      },
+      "required": ["method"],
+      "additionalProperties": false
+    },
     "McpUiResourceCsp": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object",
