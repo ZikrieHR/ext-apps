@@ -1444,12 +1444,12 @@ describe("interact tool", () => {
       await server.close();
     }, 15_000);
 
-    it("batch failure puts error message first", async () => {
-      // When [fill_form, get_screenshot] runs and get_screenshot times out,
-      // content[0] must describe the failure — not the earlier success. Some
-      // hosts flatten isError results to content[0].text only, which previously
-      // showed "Queued: Filled N fields" with isError:true and dropped the
-      // actual timeout entirely.
+    it("batch step failure: 1:1 content, no isError, ERROR-prefixed slot", async () => {
+      // LocalAgentMode SDK 2.1.87 collapses isError:true results to a bare
+      // string of content[0].text — drops images from earlier successful
+      // steps. So we don't set isError on a step failure: each command gets
+      // one content slot, the failed one starts with "ERROR", and the batch
+      // stops there. content.length tells the model how far it got.
       const { server, client } = await connect();
       const uuid = "batch-error-ordering";
 
@@ -1460,22 +1460,24 @@ describe("interact tool", () => {
           commands: [
             { action: "navigate", page: 3 }, // succeeds → "Queued: ..."
             { action: "get_screenshot", page: 1 }, // never-polled → fast-fail
+            { action: "navigate", page: 5 }, // never reached
           ],
         },
       });
 
-      expect(r.isError).toBe(true);
-      const texts = (r.content as Array<{ type: string; text: string }>).map(
-        (c) => c.text,
-      );
-      // content[0]: batch-failed summary naming the culprit
-      expect(texts[0]).toContain("failed");
-      expect(texts[0]).toContain("2/2");
-      expect(texts[0]).toContain("get_screenshot");
-      // content[1]: the actual error
-      expect(texts[1]).toContain("never connected");
-      // content[2]: the earlier success, pushed to the back
-      expect(texts[2]).toContain("Queued");
+      // Not isError — that would trigger the SDK flatten
+      expect(r.isError).toBeFalsy();
+      const content = r.content as Array<{ type: string; text?: string }>;
+      // Stopped at step 2; step 3 never ran
+      expect(content).toHaveLength(2);
+      // Slot 0: step 1's success, untouched
+      expect(content[0].text).toContain("Queued");
+      expect(content[0].text).not.toMatch(/^ERROR/);
+      // Slot 1: step 2's failure, ERROR-prefixed with the actual message
+      expect(content[1].text).toMatch(/^ERROR/);
+      expect(content[1].text).toContain("2/3");
+      expect(content[1].text).toContain("get_screenshot");
+      expect(content[1].text).toContain("never connected");
 
       await client.close();
       await server.close();
