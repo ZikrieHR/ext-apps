@@ -25,6 +25,7 @@ import {
   type LineAnnotation,
   type StampAnnotation,
   type ImageAnnotation,
+  type ImportedAnnotation,
   type NoteAnnotation,
   type FreetextAnnotation,
   cssColorToRgb,
@@ -34,6 +35,7 @@ import {
   computeDiff,
   isDiffEmpty,
   buildAnnotatedPdfBytes,
+  parseAnnotationRef,
   importPdfjsAnnotation,
   uint8ArrayToBase64,
   convertFromModelCoords,
@@ -1383,6 +1385,10 @@ const DRAGGABLE_TYPES = new Set<string>([
   "stamp",
   "note",
   "image",
+  // "imported" is draggable in the UI but the move does NOT persist to the
+  // PDF on save (addAnnotationDicts skips it). Resize/rotate stay disabled
+  // — the appearance bitmap would just stretch.
+  "imported",
 ]);
 
 function setupAnnotationInteraction(
@@ -1890,6 +1896,25 @@ function paintAnnotationsOnCanvas(
         }
         break;
       }
+
+      case "imported": {
+        const s = pdfRectToScreen(
+          { x: def.x, y: def.y, width: def.width, height: def.height },
+          viewport,
+        );
+        const bmp = annotationCanvasMap.get(def.pdfjsId);
+        ctx.save();
+        if (bmp) {
+          ctx.drawImage(bmp, s.left, s.top, s.width, s.height);
+        } else {
+          ctx.strokeStyle = "#666";
+          ctx.lineWidth = 1;
+          ctx.setLineDash([3, 3]);
+          ctx.strokeRect(s.left, s.top, s.width, s.height);
+        }
+        ctx.restore();
+        break;
+      }
     }
   }
 }
@@ -1987,6 +2012,8 @@ function renderAnnotation(
       return [renderLineAnnotation(def, viewport)];
     case "image":
       return [renderImageAnnotation(def, viewport)];
+    case "imported":
+      return [renderImportedAnnotation(def, viewport)];
   }
 }
 
@@ -2171,6 +2198,45 @@ function renderImageAnnotation(
     img.style.pointerEvents = "none";
     img.draggable = false;
     el.appendChild(img);
+  }
+  return el;
+}
+
+/**
+ * Per-annotation appearance bitmaps from page.render(). Keyed by pdf.js
+ * annotation id (e.g. "118R"). Populated for the current page only —
+ * cleared at the start of each renderPage().
+ */
+const annotationCanvasMap = new Map<string, HTMLCanvasElement>();
+
+function renderImportedAnnotation(
+  def: ImportedAnnotation,
+  viewport: { width: number; height: number; scale: number },
+): HTMLElement {
+  const screen = pdfRectToScreen(
+    { x: def.x, y: def.y, width: def.width, height: def.height },
+    viewport,
+  );
+  const el = document.createElement("div");
+  el.className = "annotation-imported";
+  el.style.left = `${screen.left}px`;
+  el.style.top = `${screen.top}px`;
+  el.style.width = `${screen.width}px`;
+  el.style.height = `${screen.height}px`;
+  el.title = `${def.subtype} (from PDF)`;
+
+  // page.render() may or may not have produced a separate canvas for this
+  // annotation (hasOwnCanvas depends on the PDF's flags). When it did, use
+  // it as a pixel-faithful body; when it didn't, the appearance is on the
+  // main canvas already, so leave the box transparent — it still captures
+  // clicks for select/delete.
+  const canvas = annotationCanvasMap.get(def.pdfjsId);
+  if (canvas) {
+    canvas.style.width = "100%";
+    canvas.style.height = "100%";
+    canvas.style.display = "block";
+    canvas.style.pointerEvents = "none";
+    el.appendChild(canvas);
   }
   return el;
 }
@@ -2761,7 +2827,8 @@ function normaliseFieldValue(
  */
 async function buildFieldNameMap(
   doc: pdfjsLib.PDFDocumentProxy,
-): Promise<void> {
+): Promise<boolean> {
+  let pushedToStorage = false;
   fieldNameToIds.clear();
   radioButtonValues.clear();
   fieldNameToPage.clear();
@@ -2857,12 +2924,16 @@ async function buildFieldNameMap(
       if (!widgetIds) continue; // no widget → not rendered anyway
 
       // Type comes from getFieldObjects (widget annot data doesn't have it).
-      // Value comes from the widget annotation (fall back to field-dict if
-      // the widget didn't expose one).
+      // Value: prefer the AcroForm field-tree value over the widget's
+      // fieldValue. pdf-lib's save() can leave a page widget pointing at a
+      // stale /V while the field tree has the new one (seen with comb text
+      // fields), and getAnnotations() reads the widget. If the two disagree
+      // we push the field-tree value into annotationStorage so the rendered
+      // input matches what's actually in /AcroForm.
       const type = fieldArr.find((f) => f.type)?.type;
-      const raw = widgetFieldValues.has(name)
-        ? widgetFieldValues.get(name)
-        : fieldArr.find((f) => f.value != null)?.value;
+      const fieldTreeRaw = fieldArr.find((f) => f.value != null)?.value;
+      const widgetRaw = widgetFieldValues.get(name);
+      const raw = fieldTreeRaw ?? widgetRaw;
       const v = normaliseFieldValue(type, raw);
       if (v !== null) {
         pdfBaselineFormValues.set(name, v);
@@ -2870,6 +2941,13 @@ async function buildFieldNameMap(
         // restored localStorage diff (applied in restoreAnnotations) will
         // overwrite specific fields the user changed.
         if (!formFieldValues.has(name)) formFieldValues.set(name, v);
+        // Widget out of sync with field tree → force storage so
+        // AnnotationLayer renders the field-tree value, not the stale
+        // widget. (syncFormValuesToStorage skips baseline==current.)
+        if (fieldTreeRaw != null && fieldTreeRaw !== widgetRaw) {
+          setFieldInStorage(name, v);
+          pushedToStorage = true;
+        }
       }
 
       // Skip parent entries with no concrete id (radio groups: the /T tree
@@ -2884,6 +2962,7 @@ async function buildFieldNameMap(
   }
 
   log.info(`Built field name map: ${fieldNameToIds.size} fields`);
+  return pushedToStorage;
 }
 
 /**
@@ -2971,6 +3050,14 @@ async function getAnnotatedPdfBytes(): Promise<Uint8Array> {
     }
   }
 
+  // Baseline annotations the user deleted: strip their refs from /Annots so
+  // they don't reappear on reload. Ids without a recoverable ref (page-index
+  // fallback) can't be removed by-ref and are skipped.
+  const removedRefs = pdfBaselineAnnotations
+    .filter((a) => !annotationMap.has(a.id))
+    .map((a) => parseAnnotationRef(a.id))
+    .filter((r): r is NonNullable<typeof r> => r !== null);
+
   // Only write fields that actually changed vs. what's already in the PDF.
   // Unchanged fields are no-ops at best, and at worst trip pdf-lib edge
   // cases (max-length text, missing /Yes appearance, …) on fields the user
@@ -2995,6 +3082,7 @@ async function getAnnotatedPdfBytes(): Promise<Uint8Array> {
     fullBytes as Uint8Array,
     annotations,
     formFieldsOut,
+    removedRefs,
   );
 }
 
@@ -3036,15 +3124,6 @@ async function savePdf(): Promise<void> {
       const sc = result.structuredContent as { mtimeMs?: number } | undefined;
       lastSavedMtime = sc?.mtimeMs ?? null;
 
-      // Rebase: the file on disk now contains our annotations + form values.
-      // Update the baseline so future diffs are relative to what was saved.
-      pdfBaselineAnnotations = [...annotationMap.values()].map((t) => ({
-        ...t.def,
-      }));
-      pdfBaselineFormValues.clear();
-      for (const [k, v] of formFieldValues) pdfBaselineFormValues.set(k, v);
-
-      setDirty(false); // → updateSaveBtn() disables button
       const key = annotationStorageKey();
       if (key) {
         try {
@@ -3053,6 +3132,13 @@ async function savePdf(): Promise<void> {
           /* ignore */
         }
       }
+      // Reload from the bytes we just wrote. The previous approach (rebase
+      // baselines but keep the old pdfDocument) drifts: subsequent renders
+      // still rasterize stripped annotations from the old bytes, and the
+      // field/widget split that pdf-lib's save can create isn't reflected
+      // until reload anyway. Reload makes "what you see = what's on disk"
+      // an invariant. (file_changed echo is suppressed by lastSavedMtime.)
+      await reloadPdf();
     }
   } catch (err) {
     log.error("Save failed:", err);
@@ -3156,8 +3242,15 @@ async function renderPage() {
     // resize so the size handoff is atomic.
     pageWrapperEl.style.transform = "";
 
-    // Scale context for retina
-    ctx.scale(dpr, dpr);
+    // Retina: pass dpr via page.render's `transform` (NOT ctx.scale).
+    // pdf.js sizes per-annotation canvases as
+    //   width = rectW * outputScaleX * viewport.scale
+    // and outputScaleX is read from transform[0] (defaults to 1). A bare
+    // ctx.scale(dpr,dpr) leaves outputScaleX at 1, so the
+    // annotationCanvasMap canvases get a half-sized backing store on
+    // retina while their internal setTransform IS dpr-aware → the
+    // appearance renders 2× too big into a 1× buffer → cropped/shifted.
+    const dprTransform = dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined;
 
     // Clear and setup text layer
     textLayerEl.innerHTML = "";
@@ -3166,11 +3259,29 @@ async function renderPage() {
     // Set --scale-factor so CSS font-size/transform rules work correctly.
     textLayerEl.style.setProperty("--scale-factor", `${scale}`);
 
-    // Render canvas - track the task so we can cancel it
+    // Render canvas - track the task so we can cancel it.
+    //
+    // annotationCanvasMap: pdf.js diverts annotations whose appearance needs
+    // its own bitmap (Stamp/Ink/FreeText/etc. with hasOwnCanvas) into
+    // per-id canvases instead of compositing onto the main canvas.
+    // renderImportedAnnotation() pulls from this map so those annotations
+    // become movable DOM elements with pixel-faithful visuals — instead of
+    // unselectable canvas pixels (the old "ghost annotation" problem) or
+    // our lossy text-label re-render.
+    annotationCanvasMap.clear();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const renderTask = (page.render as any)({
       canvasContext: ctx,
       viewport,
+      transform: dprTransform,
+      annotationCanvasMap,
+      // isEditing forces hasOwnCanvas=true for stamps regardless of /F
+      // NoRotate (StampAnnotation.mustBeViewedWhenEditing in pdf.worker).
+      // Without this, stamps without NoRotate composite onto the main canvas
+      // and deleting the "imported" overlay leaves an unclickable pixel
+      // behind. Other markup types still gate on noRotate; for those the
+      // overlay stays a transparent click-box (delete is UI-only until save).
+      isEditing: true,
     });
     currentRenderTask = renderTask;
 
@@ -3251,8 +3362,15 @@ async function renderPage() {
           commentManager: null,
         } as any);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        // Only feed Widgets (form fields) here. Markup annotations are
+        // owned by #annotation-layer; letting AnnotationLayer create
+        // <section> elements for them in #form-layer adds invisible
+        // pointer-events:auto boxes that steal clicks from our overlays.
+        const widgetAnns = annotations.filter(
+          (a: { subtype?: string }) => a.subtype === "Widget",
+        );
         await annotationLayer.render({
-          annotations,
+          annotations: widgetAnns,
           div: formLayerEl,
           page,
           viewport,
@@ -4313,8 +4431,9 @@ async function reloadPdf(): Promise<void> {
     await renderPage();
 
     await loadBaselineAnnotations(document);
-    await buildFieldNameMap(document);
+    const seeded = await buildFieldNameMap(document);
     syncFormValuesToStorage();
+    if (seeded) await renderPage();
     updateAnnotationsBadge();
     renderAnnotationPanel();
 
@@ -4539,9 +4658,16 @@ app.ontoolresult = async (result: CallToolResult) => {
     restoreAnnotations();
 
     // Build field name → annotation ID mapping for form filling
-    await buildFieldNameMap(document);
+    const seeded = await buildFieldNameMap(document);
     // Pre-populate annotationStorage from restored formFieldValues
     syncFormValuesToStorage();
+    // buildFieldNameMap may have pushed AcroForm-tree values into storage
+    // (when the page widget's /V is stale vs the field dict — pdf-lib's save
+    // can leave them split). The first renderPage above ran BEFORE that, so
+    // the form layer shows the stale widget value. Re-render so it picks up
+    // storage. Only when something was actually seeded — most PDFs don't hit
+    // this and the extra render would be pure waste.
+    if (seeded) await renderPage();
 
     updateAnnotationsBadge();
     // Save button visibility driven by setDirty()/updateSaveBtn();

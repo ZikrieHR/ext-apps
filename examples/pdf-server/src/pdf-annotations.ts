@@ -130,6 +130,32 @@ export interface ImageAnnotation extends AnnotationBase {
   aspect?: "preserve" | "ignore";
 }
 
+/**
+ * An annotation that already exists in the loaded PDF and that we render
+ * verbatim from its appearance stream (via pdf.js's annotationCanvasMap)
+ * rather than re-modeling it with one of our shape types.
+ *
+ * Covers two cases:
+ *  - subtypes we don't model (Ink, Polygon, Caret, FileAttachment, …)
+ *  - subtypes we *could* model but whose appearance carries information
+ *    our model would drop (e.g. Stamp with an image signature)
+ *
+ * The rasterized canvas is supplied at render time by mcp-app.ts; this
+ * struct only carries placement and identity. Coords are PDF user-space
+ * (origin bottom-left), matching the other rect-shaped types.
+ */
+export interface ImportedAnnotation extends AnnotationBase {
+  type: "imported";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** pdf.js getAnnotations() id (e.g. "118R") — key into annotationCanvasMap. */
+  pdfjsId: string;
+  /** Original PDF /Subtype (e.g. "Stamp", "Ink") for the panel label. */
+  subtype: string;
+}
+
 export type PdfAnnotationDef =
   | HighlightAnnotation
   | UnderlineAnnotation
@@ -140,7 +166,8 @@ export type PdfAnnotationDef =
   | LineAnnotation
   | FreetextAnnotation
   | StampAnnotation
-  | ImageAnnotation;
+  | ImageAnnotation
+  | ImportedAnnotation;
 
 // =============================================================================
 // Coordinate Conversion (model ↔ internal PDF coords)
@@ -174,6 +201,7 @@ export function convertFromModelCoords(
     case "rectangle":
     case "circle":
     case "image":
+    case "imported":
       return { ...def, y: pageHeight - def.y - def.height };
     case "line":
       return {
@@ -374,6 +402,7 @@ export function defaultColor(type: PdfAnnotationDef["type"]): string {
     case "stamp":
       return "#cc0000";
     case "image":
+    case "imported":
       return "#00000000";
   }
 }
@@ -495,6 +524,11 @@ export async function addAnnotationDicts(
   const pages = pdfDoc.getPages();
 
   for (const def of annotations) {
+    // "imported" annotations are already in the source PDF — never
+    // re-serialize them. Deletion is handled by buildAnnotatedPdfBytes'
+    // removedRefs strip; moving an imported annotation is still UI-only.
+    if (def.type === "imported") continue;
+
     const pageIdx = def.page - 1;
     if (pageIdx < 0 || pageIdx >= pages.length) continue;
     const page = pages[pageIdx];
@@ -837,15 +871,60 @@ function setButtonGroupValue(
 }
 
 /**
+ * Recover the PDF object reference from an annotation id assigned by
+ * `makeAnnotationId`. Handles both `pdf-<num>-<gen>` (from `ann.ref`) and
+ * `pdf-<num>R` (from pdf.js's string `ann.id`, gen always 0). Returns null for
+ * page-index fallback ids — those have no stable ref to remove by.
+ */
+export function parseAnnotationRef(
+  id: string,
+): { objectNumber: number; generationNumber: number } | null {
+  let m = /^pdf-(\d+)-(\d+)$/.exec(id);
+  if (m) return { objectNumber: +m[1], generationNumber: +m[2] };
+  m = /^pdf-(\d+)R$/.exec(id);
+  if (m) return { objectNumber: +m[1], generationNumber: 0 };
+  return null;
+}
+
+/**
  * Build annotated PDF bytes from the original document.
- * Applies user annotations and form fills, returns Uint8Array of the new PDF.
+ * Applies user annotations and form fills, removes baseline annotations the
+ * user deleted, returns Uint8Array of the new PDF.
  */
 export async function buildAnnotatedPdfBytes(
   pdfBytes: Uint8Array,
   annotations: PdfAnnotationDef[],
   formFields: Map<string, string | boolean>,
+  removedRefs: { objectNumber: number; generationNumber: number }[] = [],
 ): Promise<Uint8Array> {
   const pdfDoc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
+
+  // Strip baseline annotations the user deleted. We match on object number +
+  // generation against each page's /Annots array entries (PDFRef). We don't
+  // know which page they were on, so scan every page — /Annots arrays are
+  // small and this only runs at save time.
+  if (removedRefs.length > 0) {
+    const wanted = new Set(
+      removedRefs.map((r) => `${r.objectNumber} ${r.generationNumber}`),
+    );
+    for (const page of pdfDoc.getPages()) {
+      const annots = page.node.Annots();
+      if (!annots) continue;
+      // Walk backwards so .remove(idx) doesn't shift unprocessed entries.
+      for (let i = annots.size() - 1; i >= 0; i--) {
+        const ref = annots.get(i) as {
+          objectNumber?: number;
+          generationNumber?: number;
+        };
+        if (
+          ref?.objectNumber !== undefined &&
+          wanted.has(`${ref.objectNumber} ${ref.generationNumber ?? 0}`)
+        ) {
+          annots.remove(i);
+        }
+      }
+    }
+  }
 
   // Add proper PDF annotation objects
   await addAnnotationDicts(pdfDoc, annotations);
@@ -1023,14 +1102,44 @@ export function importPdfjsAnnotation(
   pageNum: number,
   index: number,
 ): PdfAnnotationDef | null {
-  const ourType = PDFJS_TYPE_MAP[ann.annotationType];
-  if (!ourType) return null;
-
-  // Skip form widgets (they're handled separately by AnnotationLayer)
-  if (ann.annotationType === 20) return null;
+  // Skip form widgets (they're handled separately by AnnotationLayer) and
+  // auxiliary types that aren't user-visible markup:
+  //   2 = Link (navigational, AnnotationLayer handles the click target)
+  //  16 = Popup (the speech-bubble UI for a parent annotation, not content)
+  if (
+    ann.annotationType === 20 ||
+    ann.annotationType === 2 ||
+    ann.annotationType === 16
+  ) {
+    return null;
+  }
 
   const id = makeAnnotationId(ann, pageNum, index);
   const color = pdfjsColorToHex(ann.color);
+  const ourType = PDFJS_TYPE_MAP[ann.annotationType];
+
+  // Anything we don't model — and stamps whose visual is an appearance
+  // stream we can't reproduce as a text label — are kept as "imported":
+  // a placement-only record that the renderer fills with the rasterized
+  // appearance from pdf.js's annotationCanvasMap. This keeps Ink, Polygon,
+  // image-signature stamps, etc. visible AND selectable in our layer.
+  const importAsBitmap =
+    !ourType || (ourType === "stamp" && ann.hasAppearance);
+  if (importAsBitmap) {
+    if (!ann.rect) return null;
+    const r = pdfjsRectToRect(ann.rect);
+    return {
+      type: "imported",
+      id,
+      page: pageNum,
+      x: r.x,
+      y: r.y,
+      width: r.width,
+      height: r.height,
+      pdfjsId: String(ann.id ?? ""),
+      subtype: String(ann.subtype ?? `type${ann.annotationType}`),
+    };
+  }
 
   switch (ourType) {
     case "highlight":

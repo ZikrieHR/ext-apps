@@ -10,6 +10,7 @@ import {
   defaultColor,
   importPdfjsAnnotation,
   buildAnnotatedPdfBytes,
+  parseAnnotationRef,
   base64ToUint8Array,
   uint8ArrayToBase64,
   convertFromModelCoords,
@@ -549,6 +550,76 @@ describe("importPdfjsAnnotation", () => {
     expect(result!.page).toBe(2);
   });
 
+  it("imports an unsupported subtype as 'imported' (placement only)", () => {
+    // annotationType 15 = Ink, not in PDFJS_TYPE_MAP. We keep it as a
+    // placement-only "imported" record so it's listed in the panel and
+    // rendered from annotationCanvasMap instead of being dropped.
+    const ann = {
+      annotationType: 15,
+      subtype: "Ink",
+      id: "200R",
+      rect: [100, 200, 180, 260],
+    };
+    const result = importPdfjsAnnotation(ann, 3, 0);
+    expect(result).not.toBeNull();
+    expect(result!.type).toBe("imported");
+    expect(result!.page).toBe(3);
+    expect((result as any).pdfjsId).toBe("200R");
+    expect((result as any).subtype).toBe("Ink");
+    expect((result as any).width).toBeCloseTo(80);
+    expect((result as any).height).toBeCloseTo(60);
+  });
+
+  it("imports an appearance-stream stamp as 'imported' (not text-label)", () => {
+    // A Stamp with hasAppearance carries a custom visual (e.g. an image
+    // signature) that our text-label StampAnnotation can't reproduce.
+    const ann = {
+      annotationType: 13,
+      subtype: "Stamp",
+      id: "118R",
+      rect: [420, 760, 514, 792],
+      hasAppearance: true,
+      contentsObj: { str: "DRAFT" },
+    };
+    const result = importPdfjsAnnotation(ann, 1, 0);
+    expect(result!.type).toBe("imported");
+    expect((result as any).pdfjsId).toBe("118R");
+    expect((result as any).subtype).toBe("Stamp");
+  });
+
+  it("computeDiff: 'imported' present in both baseline and current → no diff", () => {
+    const imp: PdfAnnotationDef = {
+      type: "imported",
+      id: "pdf-118R",
+      page: 1,
+      x: 420,
+      y: 760,
+      width: 94,
+      height: 32,
+      pdfjsId: "118R",
+      subtype: "Stamp",
+    };
+    const diff = computeDiff([imp], [imp], new Map());
+    expect(diff.added).toHaveLength(0);
+    expect(diff.removed).toHaveLength(0);
+  });
+
+  it("computeDiff: deleting an 'imported' annotation lists it in removed", () => {
+    const imp: PdfAnnotationDef = {
+      type: "imported",
+      id: "pdf-118R",
+      page: 1,
+      x: 420,
+      y: 760,
+      width: 94,
+      height: 32,
+      pdfjsId: "118R",
+      subtype: "Stamp",
+    };
+    const diff = computeDiff([imp], [], new Map());
+    expect(diff.removed).toEqual(["pdf-118R"]);
+  });
+
   it("imports a note (Text) annotation", () => {
     const ann = {
       annotationType: 1,
@@ -718,6 +789,29 @@ describe("base64 helpers", () => {
 // PDF Annotation Dict Creation (integration test with pdf-lib)
 // =============================================================================
 
+describe("parseAnnotationRef", () => {
+  it("parses pdf-<num>-<gen> ids", () => {
+    expect(parseAnnotationRef("pdf-118-0")).toEqual({
+      objectNumber: 118,
+      generationNumber: 0,
+    });
+    expect(parseAnnotationRef("pdf-5-2")).toEqual({
+      objectNumber: 5,
+      generationNumber: 2,
+    });
+  });
+  it("parses pdf-<num>R ids (pdf.js string id, gen=0)", () => {
+    expect(parseAnnotationRef("pdf-118R")).toEqual({
+      objectNumber: 118,
+      generationNumber: 0,
+    });
+  });
+  it("returns null for page-index fallback ids", () => {
+    expect(parseAnnotationRef("pdf-1-idx-3")).toBeNull();
+    expect(parseAnnotationRef("user-abc")).toBeNull();
+  });
+});
+
 describe("buildAnnotatedPdfBytes", () => {
   let blankPdfBytes: Uint8Array;
 
@@ -736,6 +830,53 @@ describe("buildAnnotatedPdfBytes", () => {
     // Verify it's a valid PDF (starts with %PDF)
     const header = String.fromCharCode(...result.slice(0, 5));
     expect(header).toBe("%PDF-");
+  });
+
+  it("strips removedRefs entries from each page's /Annots array", async () => {
+    // Seed: add two highlights, save, capture their object refs.
+    const seeded = await buildAnnotatedPdfBytes(
+      blankPdfBytes,
+      [
+        {
+          type: "highlight",
+          id: "h1",
+          page: 1,
+          rects: [{ x: 72, y: 700, width: 100, height: 12 }],
+          color: "#ffff00",
+        },
+        {
+          type: "highlight",
+          id: "h2",
+          page: 1,
+          rects: [{ x: 72, y: 680, width: 100, height: 12 }],
+          color: "#ffff00",
+        },
+      ],
+      new Map(),
+    );
+    const seededDoc = await PDFDocument.load(seeded);
+    const annots = seededDoc.getPage(0).node.Annots()!;
+    expect(annots.size()).toBe(2);
+    const ref0 = annots.get(0) as unknown as {
+      objectNumber: number;
+      generationNumber: number;
+    };
+
+    // Now remove the first one by ref.
+    const stripped = await buildAnnotatedPdfBytes(seeded, [], new Map(), [
+      { objectNumber: ref0.objectNumber, generationNumber: ref0.generationNumber },
+    ]);
+    const strippedDoc = await PDFDocument.load(stripped);
+    const remaining = strippedDoc.getPage(0).node.Annots();
+    expect(remaining?.size() ?? 0).toBe(1);
+  });
+
+  it("removedRefs ignores refs not present in /Annots", async () => {
+    const out = await buildAnnotatedPdfBytes(blankPdfBytes, [], new Map(), [
+      { objectNumber: 9999, generationNumber: 0 },
+    ]);
+    const doc = await PDFDocument.load(out);
+    expect(doc.getPage(0).node.Annots()?.size() ?? 0).toBe(0);
   });
 
   it("adds highlight annotation to PDF", async () => {
