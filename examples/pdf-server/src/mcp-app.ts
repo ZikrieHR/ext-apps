@@ -27,6 +27,7 @@ import {
   type ImageAnnotation,
   type NoteAnnotation,
   type FreetextAnnotation,
+  cssColorToRgb,
   serializeDiff,
   deserializeDiff,
   mergeAnnotations,
@@ -341,6 +342,11 @@ async function refitScale(): Promise<void> {
 // needs height changes too (rotation, browser chrome on mobile).
 let lastContainerW = 0;
 let lastContainerH = 0;
+/** One-shot: refit on the next resize even if it's a shrink in inline mode.
+ *  Set on fullscreen→inline so the page snaps to the new (smaller) width
+ *  once the host has actually resized the iframe — the inline `grewW` gate
+ *  would otherwise swallow that shrink. */
+let forceNextResizeRefit = false;
 const containerResizeObserver = new ResizeObserver(([entry]) => {
   const { width: w, height: h } = entry.contentRect;
   const grewW = w > lastContainerW + 1;
@@ -348,7 +354,12 @@ const containerResizeObserver = new ResizeObserver(([entry]) => {
     Math.abs(w - lastContainerW) > 1 || Math.abs(h - lastContainerH) > 1;
   lastContainerW = w;
   lastContainerH = h;
-  if (currentDisplayMode === "fullscreen" ? changed : grewW) refitScale();
+  if (forceNextResizeRefit && changed) {
+    forceNextResizeRefit = false;
+    refitScale();
+  } else if (currentDisplayMode === "fullscreen" ? changed : grewW) {
+    refitScale();
+  }
 });
 containerResizeObserver.observe(canvasContainerEl as HTMLElement);
 
@@ -1933,13 +1944,20 @@ function renderAnnotation(
   viewport: { width: number; height: number; scale: number },
 ): HTMLElement[] {
   switch (def.type) {
-    case "highlight":
+    case "highlight": {
+      // Force translucency: def.color is an opaque hex (e.g. "#ffff00"), which
+      // would override the rgba()/mix-blend-mode in CSS and hide the text.
+      const rgb = def.color ? cssColorToRgb(def.color) : null;
+      const bg = rgb
+        ? `rgba(${Math.round(rgb.r * 255)}, ${Math.round(rgb.g * 255)}, ${Math.round(rgb.b * 255)}, 0.35)`
+        : undefined;
       return renderRectsAnnotation(
         def.rects,
         "annotation-highlight",
         viewport,
-        def.color ? { background: def.color } : {},
+        bg ? { background: bg } : {},
       );
+    }
     case "underline":
       return renderRectsAnnotation(
         def.rects,
@@ -3322,9 +3340,13 @@ function zoomIn() {
   renderPage().then(scrollSelectionIntoView);
 }
 
-function zoomOut() {
+async function zoomOut() {
   userHasZoomed = true;
-  scale = Math.max(scale - 0.25, ZOOM_MIN);
+  // Fullscreen floor is fit-to-page (anything smaller is dead margin).
+  const fit =
+    currentDisplayMode === "fullscreen" ? await computeFitScale() : null;
+  const floor = fit !== null ? Math.max(ZOOM_MIN, fit) : ZOOM_MIN;
+  scale = Math.max(scale - 0.25, floor);
   renderPage().then(scrollSelectionIntoView);
 }
 
@@ -3761,18 +3783,39 @@ let pinchStartScale = 1.0;
 let previewScale = 1.0;
 /** Debounce timer — wheel events have no end event, so we wait for quiet. */
 let pinchSettleTimer: ReturnType<typeof setTimeout> | null = null;
+/** computeFitScale() snapshot at gesture start (async — may be null briefly). */
+let fitScaleAtPinchStart: number | null = null;
+/** Guards against firing toggleFullscreen() once per wheel event during a
+ *  single inline pinch-in gesture. */
+let modeTransitionInFlight = false;
 
 function beginPinch() {
   pinchStartScale = scale;
   previewScale = scale;
+  // Seed synchronously when we can (at fit ⇔ !userHasZoomed) so the very
+  // first updatePinch already has the right floor — avoids a one-frame
+  // jitter when the async computeFitScale resolves mid-gesture.
+  fitScaleAtPinchStart = userHasZoomed ? null : scale;
+  void computeFitScale().then((s) => (fitScaleAtPinchStart = s));
   // transform-origin matches the flex layout's anchor (justify-content:
   // center, align-items: flex-start) so the preview and the committed
   // canvas grow from the same point — otherwise the page jumps on release.
   pageWrapperEl.style.transformOrigin = "50% 0";
 }
 
+/** Fit-to-page floor for fullscreen (committed scale never goes below this).
+ *  The preview is allowed to overshoot down to 0.75×fit for rubber-band
+ *  feedback; release below 0.9×fit exits to inline, otherwise snaps to fit. */
+function pinchFitFloor(): number | null {
+  return currentDisplayMode === "fullscreen" ? fitScaleAtPinchStart : null;
+}
+
 function updatePinch(nextScale: number) {
-  previewScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, nextScale));
+  const fit = pinchFitFloor();
+  // Rubber-band: preview may dip to 0.75×fit so the user sees the page pull
+  // away as they pinch out. Committed scale is clamped to fit in commitPinch.
+  const previewFloor = fit !== null ? fit * 0.75 : ZOOM_MIN;
+  previewScale = Math.min(ZOOM_MAX, Math.max(previewFloor, nextScale));
   // Transform is RELATIVE to the rendered canvas (which sits at
   // pinchStartScale), so a previewScale equal to pinchStartScale → ratio 1.
   pageWrapperEl.style.transform = `scale(${previewScale / pinchStartScale})`;
@@ -3780,13 +3823,37 @@ function updatePinch(nextScale: number) {
 }
 
 function commitPinch() {
-  if (Math.abs(previewScale - scale) < 0.01) {
-    // Dead-zone — no re-render. Clear here since renderPage won't run.
+  const fit = pinchFitFloor();
+  // Pinched out past fit (page visibly pulled away) → exit fullscreen.
+  // Only when the gesture *started* near fit, so a single big pinch-out
+  // from deep zoom lands at fit instead of ejecting unexpectedly.
+  if (
+    fit !== null &&
+    pinchStartScale <= fit * 1.05 &&
+    previewScale < fit * 0.9
+  ) {
     pageWrapperEl.style.transform = "";
+    userHasZoomed = false; // let refitScale() size the inline view
+    forceNextResizeRefit = true; // ResizeObserver inline path ignores shrinks
+    modeTransitionInFlight = true;
+    void toggleFullscreen().finally(() => {
+      setTimeout(() => (modeTransitionInFlight = false), 250);
+    });
+    return;
+  }
+  // Committed scale never below fit in fullscreen — overshoot snaps back.
+  const target =
+    fit !== null
+      ? Math.max(fit, previewScale)
+      : Math.max(ZOOM_MIN, previewScale);
+  if (Math.abs(target - scale) < 0.01) {
+    // Snap-back / dead-zone — no re-render needed.
+    pageWrapperEl.style.transform = "";
+    zoomLevelEl.textContent = `${Math.round(scale * 100)}%`;
     return;
   }
   userHasZoomed = true;
-  scale = previewScale;
+  scale = target;
   // renderPage clears the transform in the same frame as the canvas
   // resize (after its first await) so there's no snap-back.
   renderPage().then(scrollSelectionIntoView);
@@ -3804,8 +3871,23 @@ canvasContainerEl.addEventListener(
     // Trackpad pinch arrives as wheel with ctrlKey set (Chrome/FF/Edge on
     // macOS+Windows, Safari on macOS). MUST check before the deltaX/deltaY
     // comparison below — pinch deltas come through on deltaY.
-    if (e.ctrlKey && currentDisplayMode === "fullscreen") {
+    if (e.ctrlKey) {
       e.preventDefault();
+      if (currentDisplayMode !== "fullscreen") {
+        // Inline: pinch-in (deltaY<0) is a request to go fullscreen.
+        // Pinch-out is ignored — nothing smaller than inline.
+        if (e.deltaY < 0 && !modeTransitionInFlight) {
+          modeTransitionInFlight = true;
+          void toggleFullscreen().finally(() => {
+            // Hold the latch through the settle window so the tail of the
+            // gesture doesn't immediately start zooming the new fullscreen
+            // view (or, worse, re-toggle).
+            setTimeout(() => (modeTransitionInFlight = false), 250);
+          });
+        }
+        return;
+      }
+      if (modeTransitionInFlight) return; // swallow gesture tail post-toggle
       if (pinchSettleTimer === null) beginPinch();
       // exp(-deltaY * k) makes equal-magnitude in/out deltas inverse —
       // pinch out then back lands where you started. Clamp per event so a
@@ -3826,10 +3908,15 @@ canvasContainerEl.addEventListener(
     // Only intercept horizontal scroll, let vertical scroll through
     if (Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;
 
-    // When zoomed, let natural panning happen (no page changes)
-    if (scale > 1.0) return;
+    // If the page overflows horizontally, let native panning handle it
+    // (no page changes). Checking actual overflow rather than `scale > 1.0`
+    // because fullscreen fit-scale is often >100% with the page still fully
+    // visible — we want swipe-to-page there. +1 absorbs sub-pixel rounding.
+    if (canvasContainerEl.scrollWidth > canvasContainerEl.clientWidth + 1) {
+      return;
+    }
 
-    // At 100% zoom, handle page navigation
+    // No horizontal overflow → swipe changes pages.
     e.preventDefault();
     horizontalScrollAccumulator += e.deltaX;
     if (horizontalScrollAccumulator > SCROLL_THRESHOLD) {
@@ -3858,7 +3945,7 @@ canvasContainerEl.addEventListener(
   "touchstart",
   (event) => {
     const e = event as TouchEvent;
-    if (e.touches.length !== 2 || currentDisplayMode !== "fullscreen") return;
+    if (e.touches.length !== 2) return;
     // No preventDefault here — keep iOS Safari happy. We block native
     // pinch-zoom via touch-action CSS + preventDefault on touchmove.
     touchStartDist = touchDist(e.touches);
@@ -3873,7 +3960,21 @@ canvasContainerEl.addEventListener(
     const e = event as TouchEvent;
     if (e.touches.length !== 2 || touchStartDist === 0) return;
     e.preventDefault(); // stop the browser zooming the whole viewport
-    updatePinch(pinchStartScale * (touchDist(e.touches) / touchStartDist));
+    const ratio = touchDist(e.touches) / touchStartDist;
+    if (currentDisplayMode !== "fullscreen") {
+      // Inline: a clear pinch-in means "go fullscreen". 1.15× threshold
+      // avoids triggering on jittery two-finger taps/scrolls.
+      if (ratio > 1.15 && !modeTransitionInFlight) {
+        modeTransitionInFlight = true;
+        touchStartDist = 0; // end this gesture; fullscreen will refit
+        pageWrapperEl.style.transform = "";
+        void toggleFullscreen().finally(() => {
+          setTimeout(() => (modeTransitionInFlight = false), 250);
+        });
+      }
+      return;
+    }
+    updatePinch(pinchStartScale * ratio);
   },
   { passive: false },
 );
@@ -3884,6 +3985,11 @@ canvasContainerEl.addEventListener("touchend", (event) => {
   // REMAINING set — lifting one of two leaves length 1.
   if (touchStartDist === 0 || e.touches.length >= 2) return;
   touchStartDist = 0;
+  if (currentDisplayMode !== "fullscreen") {
+    // Inline pinch that didn't cross the threshold — discard preview.
+    pageWrapperEl.style.transform = "";
+    return;
+  }
   commitPinch();
 });
 
@@ -4707,16 +4813,20 @@ function handleHostContextChanged(ctx: McpUiHostContext) {
     if (panelState.open) {
       setAnnotationPanelOpen(true);
     }
+    if (!isFullscreen) {
+      // Fullscreen zoom level is meaningless inline — always refit on exit,
+      // however it was triggered (pinch, button, host Escape/×).
+      userHasZoomed = false;
+      // The iframe shrink lands after this handler; let the ResizeObserver
+      // do one refit on that shrink (its inline branch normally ignores
+      // shrinks to avoid a requestFitToContent feedback loop).
+      forceNextResizeRefit = true;
+    }
     if (wasFullscreen !== isFullscreen) {
-      // Mode changed → refit. computeFitScale reads displayMode, so
-      // this scales UP to fill on enter and back DOWN to ≤1.0 on exit.
-      // refitScale → renderPage → requestFitToContent handles the
-      // host-resize on exit. If userHasZoomed, refit no-ops; on exit fall
-      // back to requestFitToContent so the iframe still shrinks to whatever
-      // scale the user left it at.
-      void refitScale().then(() => {
-        if (!isFullscreen && userHasZoomed) requestFitToContent();
-      });
+      // Fast-path refit (computeFitScale reads displayMode). The iframe may
+      // not have its final size yet — the ResizeObserver one-shot above
+      // covers the inline-shrink case once it does.
+      void refitScale();
     }
     updateFullscreenButton();
   }
